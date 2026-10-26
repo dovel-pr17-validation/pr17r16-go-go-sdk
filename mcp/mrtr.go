@@ -1,0 +1,330 @@
+// Copyright 2025 The Go MCP SDK Authors. All rights reserved.
+// Use of this source code is governed by the license
+// that can be found in the LICENSE file.
+
+package mcp
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"golang.org/x/sync/errgroup"
+)
+
+const maxMultiRoundTripRetries = 10
+const maxLoadSheddingMultiRoundTripRetries = 3
+
+// MultiRoundTripOptions configures the client-side multi round-trip request (SEP-2322)
+// middleware. The middleware is enabled by default and automatically fulfills input
+// requests from the server by invoking the appropriate client handlers and
+// retrying the original call.
+type MultiRoundTripOptions struct {
+	// Disabled prevents the automatic multi-round-tirp middleware from being installed.
+	// When true, the client returns input-required results directly and callers must
+	// handle the retry loop themselves using [CallToolResult.NeedsInput],
+	// [GetPromptResult.NeedsInput], or [ReadResourceResult.NeedsInput].
+	Disabled bool
+}
+
+type multiRoundTripResponse interface {
+	setResultType(resultType)
+	inputRequests() map[string]InputRequest
+	requestState() string
+	hasContent() bool
+	NeedsInput() bool
+}
+
+// asksForInput reports whether a handler's result is an input-required result.
+// SEP-2322 requires at least one of inputRequests and requestState, so a
+// result with only a requestState asks the client to continue too.
+func asksForInput(res multiRoundTripResponse) bool {
+	return res.inputRequests() != nil || res.requestState() != ""
+}
+
+// A retriedResult is a result that can record that a multi round-trip retry
+// produced it. The caching specification forbids caching such results, so
+// the one cacheable multi round-trip result, [ReadResourceResult], implements
+// it and [ClientSession.ReadResource] consults it.
+type retriedResult interface {
+	markRetried()
+}
+
+// validateMultiRoundTripResult rejects a result that carries both content and
+// input requests or a request state. [annotateResultType] labels the result
+// later, in [ServerSession.handle], so this function does not set resultType.
+func validateMultiRoundTripResult(logger *slog.Logger, res multiRoundTripResponse) error {
+	if res == nil {
+		return nil
+	}
+	if asksForInput(res) && res.hasContent() {
+		logger.Warn("handler returned both content and inputRequests or requestState")
+		return &jsonrpc.Error{
+			Code:    jsonrpc.CodeInternalError,
+			Message: "server bug: result has both content and inputRequests or requestState",
+		}
+	}
+	return nil
+}
+
+func clientSupportsMultiRoundTrip(ss *ServerSession) bool {
+	protocolVersion := latestProtocolVersion
+	if iparams := ss.InitializeParams(); iparams != nil {
+		protocolVersion = iparams.ProtocolVersion
+	}
+	return protocolVersion >= protocolVersion20260728
+}
+
+func clientMultiRoundTripMiddleware() Middleware {
+	return func(next MethodHandler) MethodHandler {
+		return func(ctx context.Context, method string, req Request) (Result, error) {
+			if method != methodCallTool && method != methodGetPrompt && method != methodReadResource {
+				return next(ctx, method, req)
+			}
+
+			loadSheddingFailures := 0
+			for retries := 1; ; retries++ {
+				res, err := next(ctx, method, req)
+				if err != nil {
+					return res, err
+				}
+				mrtrResult, ok := res.(multiRoundTripResponse)
+				if !ok {
+					return res, nil
+				}
+				reqMap := mrtrResult.inputRequests()
+				// An input-required result may carry only a requestState
+				// (SEP-2322 requires at least one of the two fields), so the
+				// result type, not the map alone, decides whether to retry.
+				if reqMap == nil && !mrtrResult.NeedsInput() {
+					if r, ok := res.(retriedResult); ok && retries > 1 && !res.isNil() {
+						r.markRetried()
+					}
+					return res, nil
+				}
+				// A result with a requestState asks to continue, so it counts as
+				// a round, not as load shedding.
+				if len(reqMap) == 0 && mrtrResult.requestState() == "" {
+					loadSheddingFailures++
+				}
+				if loadSheddingFailures >= maxLoadSheddingMultiRoundTripRetries {
+					return nil, fmt.Errorf("multi-round-trip: exceeded maximum load-shedding retries (%d)", maxLoadSheddingMultiRoundTripRetries)
+				}
+				if retries >= maxMultiRoundTripRetries {
+					return nil, fmt.Errorf("multi-round-trip: exceeded maximum retries (%d)", maxMultiRoundTripRetries)
+				}
+				cs, ok := req.GetSession().(*ClientSession)
+				if !ok {
+					return res, nil
+				}
+				responses, err := fulfillInputRequests(ctx, cs, reqMap)
+				if err != nil {
+					return nil, err
+				}
+				req, err = setMultiRoundTripRetryParams(method, req, responses, mrtrResult.requestState())
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+}
+
+// serverMultiRoundTripMiddleware is a receiving middleware for servers that transparently
+// handles multi-round-trip for clients on older protocol versions. When a handler returns
+// InputRequests and the client does not support multi-round-trip, the middleware fulfills
+// the requests by calling the client directly and reinvokes the handler with the responses,
+// repeating until the handler completes or maxMultiRoundTripRetries is reached. A result
+// with a RequestState and no input requests reinvokes the handler with that state and no
+// responses.
+func serverMultiRoundTripMiddleware() Middleware {
+	return func(next MethodHandler) MethodHandler {
+		return func(ctx context.Context, method string, req Request) (Result, error) {
+			if method != methodCallTool && method != methodGetPrompt && method != methodReadResource {
+				return next(ctx, method, req)
+			}
+
+			ss, ok := req.GetSession().(*ServerSession)
+			if !ok {
+				return next(ctx, method, req)
+			}
+			if clientSupportsMultiRoundTrip(ss) {
+				return next(ctx, method, req)
+			}
+
+			for retries := 1; ; retries++ {
+				res, err := next(ctx, method, req)
+				if err != nil {
+					return res, err
+				}
+				mrtrResult, ok := res.(multiRoundTripResponse)
+				if !ok {
+					return res, nil
+				}
+				if !asksForInput(mrtrResult) {
+					return res, nil
+				}
+				reqMap := mrtrResult.inputRequests()
+				if len(reqMap) == 0 && mrtrResult.requestState() == "" {
+					return nil, fmt.Errorf("the server is busy, retry later")
+				}
+				if retries >= maxMultiRoundTripRetries {
+					return nil, fmt.Errorf("multi-round-trip: exceeded maximum retries (%d)", maxMultiRoundTripRetries)
+				}
+				responses, err := fulfillServerInputRequests(ctx, ss, reqMap)
+				if err != nil {
+					return nil, err
+				}
+				req, err = setMultiRoundTripRetryParams(method, req, responses, mrtrResult.requestState())
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+}
+
+func fulfillServerInputRequests(ctx context.Context, ss *ServerSession, requests InputRequestMap) (InputResponseMap, error) {
+	g, ctx := errgroup.WithContext(ctx)
+	var mu sync.Mutex
+	responses := make(InputResponseMap, len(requests))
+	for id, ir := range requests {
+		g.Go(func() error {
+			resp, err := fulfillServerInputRequest(ctx, ss, ir)
+			if err != nil {
+				return fmt.Errorf("fulfilling input request %q: %w", id, err)
+			}
+			mu.Lock()
+			responses[id] = resp
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, fmt.Errorf("multi-round-trip: %w", err)
+	}
+	return responses, nil
+}
+
+func fulfillServerInputRequest(ctx context.Context, ss *ServerSession, ir InputRequest) (InputResponse, error) {
+	switch p := ir.(type) {
+	case *ElicitParams:
+		return ss.Elicit(ctx, p)
+	case *CreateMessageParams:
+		return ss.CreateMessageWithTools(ctx, createMessageParamsToWithTools(p))
+	case *CreateMessageWithToolsParams:
+		return ss.CreateMessageWithTools(ctx, p)
+	case *ListRootsParams:
+		return ss.ListRoots(ctx, p)
+	default:
+		return nil, fmt.Errorf("unknown input request type: %T", ir)
+	}
+}
+
+func createMessageParamsToWithTools(p *CreateMessageParams) *CreateMessageWithToolsParams {
+	var msgs []*SamplingMessageV2
+	for _, m := range p.Messages {
+		msgs = append(msgs, &SamplingMessageV2{Content: []Content{m.Content}, Role: m.Role})
+	}
+	return &CreateMessageWithToolsParams{
+		Meta:             p.Meta,
+		IncludeContext:   p.IncludeContext,
+		MaxTokens:        p.MaxTokens,
+		Messages:         msgs,
+		Metadata:         p.Metadata,
+		ModelPreferences: p.ModelPreferences,
+		StopSequences:    p.StopSequences,
+		SystemPrompt:     p.SystemPrompt,
+		Temperature:      p.Temperature,
+	}
+}
+
+// setMultiRoundTripRetryParams returns the request for the next round of a
+// multi-round-trip retry: a request whose params are a shallow copy of the
+// original, carrying the fulfilled responses and the request state to echo.
+// The original params are never mutated: on the client side they are
+// caller-owned, and a params struct reused across calls must not carry one
+// call's inputResponses and requestState into the next, where a server
+// gating on them (for example an elicitation confirmation) would treat the
+// new call as already answered.
+//
+// An unrecognized params type is an error. It cannot occur on the server
+// side, but client sending middleware runs before the retry loop and may
+// substitute its own params.
+func setMultiRoundTripRetryParams(method string, req Request, responses InputResponseMap, state string) (Request, error) {
+	var retryParams Params
+	switch p := req.GetParams().(type) {
+	case *CallToolParams:
+		cp := *p
+		cp.InputResponses = responses
+		cp.RequestState = state
+		retryParams = &cp
+	case *CallToolParamsRaw:
+		cp := *p
+		cp.InputResponses = responses
+		cp.RequestState = state
+		retryParams = &cp
+	case *GetPromptParams:
+		cp := *p
+		cp.InputResponses = responses
+		cp.RequestState = state
+		retryParams = &cp
+	case *ReadResourceParams:
+		cp := *p
+		cp.InputResponses = responses
+		cp.RequestState = state
+		retryParams = &cp
+	default:
+		return nil, fmt.Errorf("multi-round-trip: unsupported params type %T", p)
+	}
+	switch s := req.GetSession().(type) {
+	case *ClientSession:
+		return newClientRequest(s, retryParams), nil
+	case *ServerSession:
+		// Rebuild with the same constructor handleReceive uses: the
+		// receiving dispatch type-asserts on the request's concrete
+		// *ServerRequest[P] type, and Extra must carry over.
+		return s.receivingMethodInfos()[method].newRequest(s, retryParams, req.GetExtra()), nil
+	default:
+		return nil, fmt.Errorf("multi-round-trip: unsupported session type %T", s)
+	}
+}
+
+func fulfillInputRequests(ctx context.Context, cs *ClientSession, requests InputRequestMap) (InputResponseMap, error) {
+	g, ctx := errgroup.WithContext(ctx)
+	var mu sync.Mutex
+	responses := make(InputResponseMap, len(requests))
+	for id, ir := range requests {
+		g.Go(func() error {
+			resp, err := fulfillInputRequest(ctx, cs, ir)
+			if err != nil {
+				return fmt.Errorf("fulfilling input request %q: %w", id, err)
+			}
+			mu.Lock()
+			responses[id] = resp
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, fmt.Errorf("multi round-trip: %w", err)
+	}
+	return responses, nil
+}
+
+func fulfillInputRequest(ctx context.Context, cs *ClientSession, ir InputRequest) (InputResponse, error) {
+	switch p := ir.(type) {
+	case *ElicitParams:
+		return cs.client.elicit(ctx, newClientRequest(cs, p))
+	case *CreateMessageParams:
+		return cs.client.createMessage(ctx, &CreateMessageWithToolsRequest{Session: cs, Params: createMessageParamsToWithTools(p)})
+	case *CreateMessageWithToolsParams:
+		return cs.client.createMessage(ctx, &CreateMessageWithToolsRequest{Session: cs, Params: p})
+	case *ListRootsParams:
+		return cs.client.listRoots(ctx, newClientRequest(cs, p))
+	default:
+		return nil, fmt.Errorf("unknown input request type: %T", ir)
+	}
+}
